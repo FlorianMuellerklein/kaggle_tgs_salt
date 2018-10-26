@@ -88,9 +88,9 @@ def augment_img(imgs, imsize, mt=False):
         # flip lr
         imgs = [np.fliplr(x) for x in imgs]    
 
-    #if np.random.rand() > 0.5:
+    if random.random() > 0.5:
         # flip ud
-    #    imgs = [np.flipud(x) for x in imgs]
+        imgs = [np.flipud(x) for x in imgs]
 
     #if np.random.rand() > 0.5:
         # random 90 degree rotation

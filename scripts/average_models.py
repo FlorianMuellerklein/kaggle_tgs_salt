@@ -17,6 +17,8 @@ import torch.nn.functional as F
 import torchvision as vsn
 
 from skimage.transform import resize
+from skimage.morphology import remove_small_holes
+from skimage.morphology import remove_small_objects
 
 from models.nets import ResUNet
 from utils.data_loaders import get_test_loader
@@ -39,6 +41,10 @@ parser.add_argument('--flip_tta', action='store_true',
                     help='whether to horizontal flip TTA')
 parser.add_argument('--use_bool', action='store_true',
                     help='whether to use empty predictions')
+parser.add_argument('--use_all', action='store_true',
+                    help='whether to use output from deeply supervised parts')
+parser.add_argument('--mask_zeros', action='store_true',
+                    help='whether to set full masks as all 0')
 args = parser.parse_args()
 
 
@@ -108,6 +114,16 @@ def rle_encoding(x):
     print(run_lengths)
     return run_lengths
 
+def average_deep_superviz(tensor_list):
+    for i, tensor in enumerate(tensor_list[:3]):
+        #print(tensor.size())
+        if i == 0:
+            out_tensor = tensor
+        else:
+            out_tensor += tensor
+
+    return out_tensor / float(len(tensor_list[:3]))
+
 def make_preds():
     # keep list of prediction per batch
     test_ids = []
@@ -127,20 +143,27 @@ def make_preds():
             # get predictions
             preds = net(test_imgs)
             if args.use_bool:
-                bool_preds = preds[1].sigmoid()
+                bool_preds = preds[-1].sigmoid()
                 preds = preds[0].sigmoid()
+            elif args.use_all:
+                preds = average_deep_superviz(preds[:-1])
+                bool_preds = preds[-1].sigmoid()
             else:
-                preds = preds.sigmoid()
+                preds = preds[0].sigmoid()
                
             if args.flip_tta:
                 test_imgs_lr = data['img_lr'].cuda(async=True)
                 preds_lr_ = net(test_imgs_lr)
                 if args.use_bool:
-                    bool_lr = preds_lr_[1].sigmoid()
+                    bool_lr = preds_lr_[-1].sigmoid()
                     preds_lr_ = preds_lr_[0].sigmoid()
                     bool_preds = (bool_lr + bool_preds) / 2.
+                elif args.use_all:
+                    preds_lr_ = average_deep_superviz(preds_lr_[:-1])
+                    bool_lr = preds_lr_[-1].sigmoid()
+                    bool_preds = (bool_lr + bool_preds) / 2.
                 else:
-                    preds_lr_ = preds_lr_.sigmoid()
+                    preds_lr_ = preds_lr_[0].sigmoid()
                 
                 preds_lr = np.zeros((preds_lr_.size())).astype(np.float32)
                 preds_lr = np.copy(preds_lr_.data.cpu().numpy()[:,:,:,::-1])
@@ -157,11 +180,12 @@ def make_preds():
                     averaged_bool_preds.append(bool_preds.data.cpu())
             else:
                 averaged_mask_preds[batch_idx] += preds.data.view(-1, args.imsize, args.imsize).cpu()
-                averaged_bool_preds[batch_idx] += bool_preds.data.cpu()
+                if args.use_bool:
+                    averaged_bool_preds[batch_idx] += bool_preds.data.cpu()
     
     print('Predicted mask sizes')
-    for i in range(len(averaged_mask_preds)):
-        print(averaged_mask_preds[i].size())
+    #for i in range(len(averaged_mask_preds)):
+    #    print(averaged_mask_preds[i].size())
 
     avg_preds = torch.cat(averaged_mask_preds, dim=0)
     #print(avg_preds)
@@ -196,14 +220,19 @@ def make_preds():
     rles = []
     ids = []
     for j in range(pred_np.shape[0]):
-        if args.imsize == 256:
-            predicted_mask = resize(pred_np[j][27:229, 27:229], (101,101),
-                                    preserve_range=True)
-        else:
-            predicted_mask = pred_np[j][13:114, 13:114]
-            predicted_mask = np.where(predicted_mask > 0.4, 1, 0)
-            rles.append(RLenc(predicted_mask.astype(np.int32)))
-            ids.append(test_ids[j])
+        #if args.imsize == 256:
+        #    predicted_mask = resize(pred_np[j][27:229, 27:229], (101,101),
+        #                            preserve_range=True)
+        #else:
+        predicted_mask = pred_np[j][13:114, 13:114]
+        predicted_mask = np.where(predicted_mask > 0.5, 1, 0)
+        #predicted_mask = remove_small_holes(predicted_mask.astype(np.int32), in_place=True)
+        #predicted_mask = remove_small_objects(predicted_mask, in_place=True)
+        if args.mask_zeros:
+            if predicted_mask.sum() >= 10001:
+                predicted_mask = np.zeros((101,101))
+        rles.append(RLenc(predicted_mask))
+        ids.append(test_ids[j])
             
     print(len(ids), len(rles))
     #print({'id':ids[:4], 'rle_mask':rles[:4]})

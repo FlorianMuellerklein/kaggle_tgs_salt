@@ -32,17 +32,17 @@ parser.add_argument('--epochs', default=1000, type=int,
                     help='number of epochs')
 parser.add_argument('--lr_max', default=0.01, type=float,
                     help='initial learning rate')
-parser.add_argument('--lr_min', default=0.0003, type=float,
+parser.add_argument('--lr_min', default=0.001, type=float,
                     help='min lr for cosine annealing')
 parser.add_argument('--lr_rampup', default=1, type=int,
                     help='how long to ramp up the unsupervised weight')
-parser.add_argument('--lr_rampdown', default=65, type=int,
+parser.add_argument('--lr_rampdown', default=75, type=int,
                     help='how long to ramp up the unsupervised weight')
 parser.add_argument('--num_cycles', default=5, type=int, 
                     help='number of learning rate cycles')
 parser.add_argument('--l2', default=1e-4, type=float,
                     help='l2 regularization for model')
-parser.add_argument('--lambda_bool', default=0.5, type=float,
+parser.add_argument('--lambda_bool', default=0.05, type=float,
                     help='lambda value for coordinate loss')
 parser.add_argument('--es_patience', default=50, type=int, 
                     help='early stopping patience')
@@ -76,7 +76,7 @@ focal_loss = FocalLoss2d()
 bce = nn.BCEWithLogitsLoss()
 
 # training function
-def train(net, optimizer, train_loader, freeze_bn=False, use_lovasz=False, swa=False):
+def train(net, optimizer, train_loader, freeze_bn=False, swa=False):
     '''
     uses the data loader to grab a batch of images
     pushes images through network and gathers predictions
@@ -93,28 +93,36 @@ def train(net, optimizer, train_loader, freeze_bn=False, use_lovasz=False, swa=F
     # loop over the images for the desired amount
     for i, data in enumerate(train_loader):
         imgs = data['img'].to(device)
-        msks = data['msk'].to(device)
-        msk_bool = data['has_msk'].float().to(device)
+        msks = data['msk'] 
+        msk_bool = data['has_msk'].to(device)
 
         if args.debug and i == 0:
             img_grid = vsn.utils.make_grid(imgs, normalize=True)
             msk_grid = vsn.utils.make_grid(msks)
+            #msk_hgrid = vsn.utils.make_grid(msks_half)
+            #msk_qgrid = vsn.utils.make_grid(msks_qrtr) 
 
             vsn.utils.save_image(img_grid, '../imgs/train_imgs.png')
             vsn.utils.save_image(msk_grid, '../imgs/train_msks.png')
-             
+            #vsn.utils.save_image(msk_hgrid, '../imgs/train_msks_half.png')
+            #vsn.utils.save_image(msk_qgrid, '../imgs/train_msks_qrtr.png')
+
         # get predictions
-        msk_preds, bool_preds = net(imgs)
-        msk_blend = msk_preds * bool_preds.view(imgs.size(0), 1, 1, 1)
-    
+        msk_preds = net(imgs)
+        #print(len(msk_preds), len(msks))
         # calculate loss
-        if use_lovasz:
-            loss = L.lovasz_hinge(msk_preds, msks)
-        else:
-            loss = focal_loss(msk_preds, msks)
-            loss += L.lovasz_hinge(msk_preds, msks)
-        loss += args.lambda_bool * bce(bool_preds, msk_bool.view(-1,1))
-        loss += args.lambda_bool * focal_loss(msk_blend, msks)
+        # main mask loss
+        loss = focal_loss(msk_preds[0], msks[0].to(device))
+        loss += L.lovasz_hinge(msk_preds[0], msks[0].to(device))
+        
+        # aux mask losses
+        for j in range(len(msks)):
+            #print(msk_preds[j+1].size(), msks[j].size())
+            loss += 0.1 * focal_loss(msk_preds[j+1][msk_bool], msks[j][msk_bool].to(device))
+            loss += 0.1 * L.lovasz_hinge(msk_preds[j+1][msk_bool], msks[j][msk_bool].to(device))
+        
+        # binary loss
+        loss += 0.05 * bce(msk_preds[-1], msk_bool.float().view(-1,1))
         
         # zero gradients from previous run
         optimizer.zero_grad()
@@ -137,7 +145,7 @@ def train(net, optimizer, train_loader, freeze_bn=False, use_lovasz=False, swa=F
     return epoch_loss
 
 # validation function
-def valid(net, optimizer, valid_loader, use_lovasz=False, save_imgs=False, fold_num=0):
+def valid(net, optimizer, valid_loader, save_imgs=False, fold_num=0):
     net.eval() 
     # keep track of losses
     val_ious = []
@@ -146,38 +154,32 @@ def valid(net, optimizer, valid_loader, use_lovasz=False, save_imgs=False, fold_
     with torch.no_grad():
         for i, data in enumerate(valid_loader):
             valid_imgs = data['img'].to(device)
-            valid_msks = data['msk'].to(device)
-            valid_msk_bool = data['has_msk'].float().to(device)
+            valid_msks = data['msk']
+            #valid_msks_half = data['msk_half'].to(device)
+            #valid_msks_qrtr = data['msk_qrtr'].to(device)
+            valid_msk_bool = data['has_msk'].to(device)
             # get predictions
-            msk_vpreds, bool_vpreds = net(valid_imgs)
-            msk_blend_vpreds = msk_vpreds * bool_vpreds.view(valid_imgs.size(0), 1, 1, 1)
-
-            if save_imgs:
-                img_grid = vsn.utils.make_grid(valid_imgs, normalize=True)
-                msk_grid = vsn.utils.make_grid(msk_vpreds)
-
-                vsn.utils.save_image(img_grid, '../imgs/valid_imgs_fold-{}.png'.format(fold_num))
-                vsn.utils.save_image(msk_grid, '../imgs/valid_msks_fold-{}.png'.format(fold_num))
-        
+            msk_vpreds = net(valid_imgs)
+       
             # calculate loss
-            if use_lovasz:
-                vloss = L.lovasz_hinge(msk_vpreds, valid_msks)
-                #vloss += focal_loss(msk_vpreds, valid_msks)
-                #vloss -= dice(msk_vpreds.sigmoid(), valid_msks)
-            else:
-                vloss = focal_loss(msk_vpreds, valid_msks)
-                vloss += L.lovasz_hinge(msk_vpreds, valid_msks)
-                #vloss -= dice(msk_vpreds.sigmoid(), valid_msks)
-            
-            vloss += args.lambda_bool * bce(bool_vpreds, valid_msk_bool.view(-1,1))
-            vloss += args.lambda_bool * focal_loss(msk_blend_vpreds, valid_msks)
+            # main mask loss
+            vloss = focal_loss(msk_vpreds[0], valid_msks[0].to(device))
+            vloss += L.lovasz_hinge(msk_vpreds[0], valid_msks[0].to(device))
 
-            #vloss += args.lambda_dice * dice(msk_vpreds.sigmoid(), valid_msks)
+            # aux mask losses
+            for j in range(len(valid_msks)):
+                #print(msk_preds[i+1].size(), msks[i].size())
+                vloss += 0.1 * focal_loss(msk_vpreds[j+1][valid_msk_bool], valid_msks[j][valid_msk_bool].to(device))
+                vloss += 0.1 * L.lovasz_hinge(msk_vpreds[j+1][valid_msk_bool], valid_msks[j][valid_msk_bool].to(device))
+
+            # binary loss
+            vloss += 0.05 * bce(msk_vpreds[-1], valid_msk_bool.float().view(-1,1))
+ 
             # get validation stats
             val_iter_loss += vloss.item()
             
-            val_ious.append(get_iou_vector(valid_msks.cpu().numpy()[:,:,13:114, 13:114], 
-                                           msk_vpreds.sigmoid().cpu().numpy()[:,:,13:114, 13:114]))
+            val_ious.append(get_iou_vector(valid_msks[0].cpu().numpy()[:,:,13:114, 13:114], 
+                                           msk_vpreds[0].sigmoid().cpu().numpy()[:,:,13:114, 13:114]))
             
     epoch_vloss = val_iter_loss / (len(valid_loader.dataset) / args.batch_size)
     print('Avg Eval Loss: {:.4}, Avg IOU: {:.4}'.format(epoch_vloss, np.mean(val_ious)))
@@ -196,7 +198,6 @@ def train_network(net, fold=0, model_ckpt=None):
 
         # training flags
         swa = False
-        use_lovasz = False
         freeze_bn = False
         save_imgs = False
         train_losses = []
@@ -229,14 +230,15 @@ def train_network(net, fold=0, model_ckpt=None):
                 # reset the counter
                 t_ = 0
                 cycle += 1
+                best_val_iou = 0.0
                 torch.save(net.state_dict(), 
                            '../model_weights/{}_{}_cycle-{}_fold-{}.pth'.format(args.model_name,
                                                                                      args.exp_name,
                                                                                      cycle,
                                                                                      fold))
-                save_imgs = True
-            else:
-                save_imgs = False
+            #    save_imgs = True
+            #else:
+            #    save_imgs = False
            
             for params in optimizer.param_groups:
                 #print('t_', t_)
@@ -248,8 +250,8 @@ def train_network(net, fold=0, model_ckpt=None):
 
                 print('Learning rate set to {:.4}'.format(optimizer.param_groups[0]['lr']))
 
-            t_l = train(net, optimizer, train_loader, freeze_bn, use_lovasz)
-            v_l, viou = valid(net, optimizer, valid_loader, use_lovasz, save_imgs, fold)
+            t_l = train(net, optimizer, train_loader, freeze_bn)
+            v_l, viou = valid(net, optimizer, valid_loader, save_imgs, fold)
 
             #if swa:
                
@@ -257,7 +259,10 @@ def train_network(net, fold=0, model_ckpt=None):
             #if not args.cos_anneal:
             if viou > best_val_iou:
                 net.eval()
-                torch.save(net.state_dict(), model_ckpt)
+                torch.save(net.state_dict(), '../model_weights/best_{}_{}_cycle-{}_fold-{}.pth'.format(args.model_name,
+                                                                                              args.exp_name,
+                                                                                              cycle,
+                                                                                              fold))
                 best_val_metric = v_l
                 best_val_iou = viou
                 valid_patience = 0
@@ -269,11 +274,7 @@ def train_network(net, fold=0, model_ckpt=None):
                 break
 
             # if the model doesn't improve for n epochs, reduce learning rate
-            if cycle  >= 1: 
-                if args.use_lovasz:
-                    print('switching to lovasz')
-                    use_lovasz = True
-                   
+            if cycle  >= 1:  
                 #dice_weight += 0.5
                 if not args.cos_anneal:
                     print('Reducing learning rate by {}'.format(args.lr_scale))
@@ -296,14 +297,14 @@ def train_network(net, fold=0, model_ckpt=None):
         pass
 
     if args.swa:
-        for i in range(cycle):
-            if i == 0:
-                net.load_state_dict(torch.load('../swa/cycle_{}.pth'.format(i),
+        for cycle_idx in range(cycle):
+            if cycle_idx == 0:
+                net.load_state_dict(torch.load('../swa/cycle_{}.pth'.format(cycle_idx),
 		                                 map_location=lambda storage, loc: storage))
             else:
-                alpha = 1. / (i + 1.)
+                alpha = 1. / (cycle_idx + 1.)
                 prev = ResUNet()
-                prev.load_state_dict(torch.load('../swa/cycle_{}.pth'.format(i),
+                prev.load_state_dict(torch.load('../swa/cycle_{}.pth'.format(cycle_idx),
 		                                 map_location=lambda storage, loc: storage))
 	        # average weights
                 for param_c, param_p in zip(net.parameters(), prev.parameters()):

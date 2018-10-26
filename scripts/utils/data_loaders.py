@@ -36,13 +36,14 @@ def add_depth_channels(image_tensor):
 
 class MaskDataset(data.Dataset):
     '''Generic dataloader for a pascal VOC format folder'''
-    def __init__(self, imsize=128, img_ids=None, img_paths=None, 
+    def __init__(self, imsize=128, img_ids=None, img_paths=None, num_folds=None,
                  mask_paths=None, valid=False, small_msk_ids=None):
         self.valid = valid
         self.imsize = imsize
         self.img_ids = img_ids
         self.img_paths = img_paths
         self.mask_paths = mask_paths
+        self.num_folds = num_folds
         self.small_msk_ids = small_msk_ids
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                               std=[0.229, 0.224, 0.225])
@@ -53,7 +54,7 @@ class MaskDataset(data.Dataset):
         # super sample small masks
         #if random.random() > 0.25 or self.valid:
         img = img_as_float(imread(self.img_paths + self.img_ids[index]))[:,:,:3]
-        #img[:,:,2] = 1. - fltrs.laplace(img[:,:,1])
+        #img[:,:,2] = 1. - fltrs.laplace(img[:,:,0])
         msk = imread(self.mask_paths + self.img_ids[index]).astype(np.bool)
         msk = np.expand_dims(msk, axis=-1)
         #else:
@@ -82,10 +83,22 @@ class MaskDataset(data.Dataset):
 
         msk_tch = torch.from_numpy(msk_np.astype(np.float32))
 
-        img_tch = add_depth_channels(img_tch)
+        msk_half_np = np.expand_dims(resize(msk_np[0].astype(np.float32), (64,64), preserve_range=True), axis=-1).transpose(2,0,1)
+        msk_half_tch = torch.from_numpy(msk_half_np.astype(np.float32))
+        msk_qrtr_np = np.expand_dims(resize(msk_np[0].astype(np.float32), (32,32), preserve_range=True), axis=-1).transpose(2,0,1)
+        msk_qrtr_tch = torch.from_numpy(msk_qrtr_np.astype(np.float32))
+        msk_eigt_np = np.expand_dims(resize(msk_np[0].astype(np.float32), (16,16), preserve_range=True), axis=-1).transpose(2,0,1)
+        msk_eigt_tch = torch.from_numpy(msk_eigt_np.astype(np.float32))
+        msk_sixteen_np = np.expand_dims(resize(msk_np[0].astype(np.float32), (8,8), preserve_range=True), axis=-1).transpose(2,0,1)
+        msk_sixteen_tch = torch.from_numpy(msk_sixteen_np.astype(np.float32))
+
+        #img_tch = add_depth_channels(img_tch)
 
         out_dict = {'img': img_tch,
-                    'msk': msk_tch,
+                    'msk': [msk_tch, msk_half_tch, msk_qrtr_tch, msk_eigt_tch, msk_sixteen_tch],
+                    #'msk_dwnsample': [msk_half_tch, msk_qrtr_tch, msk_eigt_tch, msk_sixteen_tch],
+                    #'msk_qrtr': msk_qrtr_tch, 
+                    #'msk_eigt': msk_eigt_tch,
                     'has_msk': msk_tch.sum() > 0,
                     'id': self.img_ids[index].replace('.png', '')}
 
@@ -93,9 +106,9 @@ class MaskDataset(data.Dataset):
 
     def __len__(self):
         if self.valid:
-            return int(len(self.img_ids) * 0.2)
+            return int(len(self.img_ids) * (1. / self.num_folds))
         else:
-            return int(len(self.img_ids) * 0.8)
+            return int(len(self.img_ids) * ((self.num_folds - 1.) / self.num_folds))
 
 
 class MaskDataset_MT(data.Dataset):
@@ -141,10 +154,14 @@ class MaskDataset_MT(data.Dataset):
         img_b = mt_noise(img)
 
         msk_tch = torch.from_numpy(msk.astype(np.float32))
-        
+        msk_half_tch = torch.from_numpy(resize(msk.astype(np.float32), (64,64), preserve_range=True))
+        msk_qrtr_tch = torch.from_numpy(resize(msk.astype(np.float32), (32,32), preserve_range=True))
+
         out_dict = {'img_a': self.normalize(torch.from_numpy(img_a.astype(np.float32))),
                     'img_b': self.normalize(torch.from_numpy(img_b.astype(np.float32))),
                     'msk': msk_tch,
+                    'msk_half': msk_half_tch,
+                    'msk_qrtr': msk_qrtr_tch,
                     'has_msk': msk_tch.sum() > 0,
                     'is_labeled': torch.tensor(labeled).long()}
 
@@ -181,8 +198,8 @@ class MaskTestDataset(data.Dataset):
         img_tch = self.normalize(torch.from_numpy(img))
         img_lr_tch = self.normalize(torch.from_numpy(img_lr))
        
-        img_tch = add_depth_channels(img_tch)
-        img_lr_tch = add_depth_channels(img_lr_tch)
+        #img_tch = add_depth_channels(img_tch)
+        #img_lr_tch = add_depth_channels(img_lr_tch)
 
         out_dict = {'img': img_tch,
                     'img_lr': img_lr_tch,
@@ -213,11 +230,11 @@ def get_data_loaders(imsize=128, batch_size=16, num_folds=5, fold=0):
     valid_sampler = SubsetRandomSampler(valid_idx)  
 
     # set up the datasets
-    train_dataset = MaskDataset(imsize=imsize, img_ids=img_ids,
+    train_dataset = MaskDataset(imsize=imsize, img_ids=img_ids, num_folds=num_folds,
                                   img_paths='../data/train/images/',
                                   mask_paths='../data/train/masks/',
                                   small_msk_ids=small_msk_ids)
-    valid_dataset = MaskDataset(imsize=imsize, img_ids=img_ids,
+    valid_dataset = MaskDataset(imsize=imsize, img_ids=img_ids, num_folds=num_folds,
                                   img_paths='../data/train/images/',
                                   mask_paths='../data/train/masks/',
                                   valid=True)
@@ -228,7 +245,8 @@ def get_data_loaders(imsize=128, batch_size=16, num_folds=5, fold=0):
                                        shuffle=False,
                                        sampler=train_sampler,
                                        num_workers=4,
-                                       pin_memory=True)
+                                       pin_memory=True,
+                                       drop_last=True)
 
     valid_loader = data.DataLoader(valid_dataset,
                                        batch_size=batch_size,
